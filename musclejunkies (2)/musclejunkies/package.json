@@ -1,0 +1,8 @@
+{
+  "name": "musclejunkies",
+  "version": "1.0.0",
+  "description": "Muscle Junkies — Tienda online de suplementos",
+  "engines": {
+    "node": ">=18"
+  }
+}

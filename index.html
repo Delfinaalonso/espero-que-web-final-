@@ -1563,17 +1563,85 @@ Escribinos por WhatsApp o Instagram para consultas, pedidos y asesoramiento sobr
 <div id="toast-container"></div>
 
 <script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script>
-// Fuente de datos: Supabase (vía Netlify Function /api/productos)
+// Fuente de datos: Supabase directo (Cloudflare Pages compatible)
+const SUPABASE_URL = window.__SUPABASE_URL__ || 'https://fvdzqzrlgueegjlpycbz.supabase.co';
+const SUPABASE_KEY = window.__SUPABASE_ANON_KEY__ || '';
 
-// ── CARGAR PRODUCTOS DESDE SUPABASE (via Netlify function) ──
+function hasSupabasePublicConfig() {
+  return Boolean(SUPABASE_URL && SUPABASE_KEY);
+}
+
+async function sbRead(path) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1${path}`, {
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Accept': 'application/json',
+    },
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Supabase ${res.status}: ${errText || 'request failed'}`);
+  }
+
+  return res.json();
+}
+
+function mapProductsForFrontend(productsRows, variantRows) {
+  const variantsByProduct = {};
+  (variantRows || []).forEach(v => {
+    if (!variantsByProduct[v.product_id]) variantsByProduct[v.product_id] = [];
+    variantsByProduct[v.product_id].push(v);
+  });
+
+  return (productsRows || []).map(p => {
+    const pvariants = variantsByProduct[p.id] || [];
+    const flavors = pvariants.map(v => v.flavor).filter(Boolean);
+    const dosage = (p.dosage_amount || p.dosage_when || p.dosage_how)
+      ? { amount: p.dosage_amount || '', when: p.dosage_when || '', how: p.dosage_how || '' }
+      : null;
+
+    return {
+      id: p.id,
+      slug: p.slug,
+      name: p.name,
+      category: p.category,
+      price: p.price,
+      originalPrice: p.original_price || null,
+      rating: 5.0,
+      reviews: 0,
+      featured: p.featured === true || p.is_featured === true,
+      visible: p.visible === true,
+      flavors: flavors.length > 0 ? flavors : null,
+      description: p.description || '',
+      benefits: p.benefits || [],
+      ingredients: p.ingredients || null,
+      dosage,
+      idealFor: p.ideal_for || null,
+      supplementFacts: p.supplement_facts || null,
+      faq: p.faq || null,
+      imageUrl: p.image_url || null,
+      variantId: pvariants[0]?.id || p.id,
+      variants: pvariants.map(v => ({ id: v.id, flavor: v.flavor, price: v.price || p.price, stock: v.stock })),
+    };
+  });
+}
+
 async function loadProductsFromDB() {
   try {
     showLoadingState();
-    const res = await fetch('/api/productos');
-    if (!res.ok) throw new Error('HTTP ' + res.status);
 
-    const data = await res.json();
-    products = Array.isArray(data) ? data : [];
+    if (!hasSupabasePublicConfig()) {
+      throw new Error('Falta configuración pública de Supabase (__SUPABASE_URL__ / __SUPABASE_ANON_KEY__)');
+    }
+
+    const [productsRows, variantsRows] = await Promise.all([
+      sbRead('/products?visible=eq.true&order=category.asc,name.asc&select=*'),
+      sbRead('/variants?select=*'),
+    ]);
+
+    products = mapProductsForFrontend(productsRows, variantsRows);
 
     const publicProducts = products.filter(p => p && p.visible === true);
     categories = [...new Set(publicProducts.map(p => p.category).filter(Boolean))].sort();
@@ -1582,6 +1650,7 @@ async function loadProductsFromDB() {
     console.log('✅ ' + publicProducts.length + ' productos visibles cargados desde Supabase');
   } catch(err) {
     console.error('❌ Error cargando productos desde Supabase:', err.message);
+    showToast('No se pudieron cargar productos desde Supabase.');
     products = [];
     categories = [];
     featuredProducts = [];
@@ -1896,50 +1965,43 @@ function hideLoadingState() {
   // Los grids se reemplazan al renderizar, nada extra que hacer
 }
 
-// ── CHECKOUT → MERCADO PAGO ──
-// Recibe: { items: [{ variantId, name, price, quantity }], customer: {...} }
-// Devuelve: { checkoutUrl: "https://mpago.la/..." }
-async function goToCheckout() {
+// ── CHECKOUT ──
+// Cloudflare Pages (sitio estático): checkout por WhatsApp con resumen del carrito.
+function goToCheckout() {
   const btn = document.getElementById('btn-checkout');
   if (!cart.length) return;
 
   try {
-    if (btn) { btn.disabled = true; btn.textContent = 'Procesando...'; }
+    if (btn) { btn.disabled = true; btn.textContent = 'Redirigiendo...'; }
 
-    const items = cart.map(item => ({
-      variantId: item.variantId || item.product.id,
-      name: item.product.name + (item.flavor ? ' — ' + item.flavor : ''),
-      price: item.product.price,
-      quantity: item.quantity,
-    }));
-
-    const res = await fetch('/api/checkout', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ items }),
+    const lines = cart.map(item => {
+      const flavor = item.flavor ? ` (${item.flavor})` : '';
+      const subtotal = (item.product.price || 0) * (item.quantity || 1);
+      return `• ${item.quantity}x ${item.product.name}${flavor} — ${fmt(subtotal)}`;
     });
 
-    if (!res.ok) throw new Error('Error al crear el pedido (HTTP ' + res.status + ')');
+    const total = cart.reduce((sum, item) => sum + (item.product.price || 0) * (item.quantity || 1), 0);
+    const message = [
+      'Hola! Quiero finalizar esta compra:',
+      '',
+      ...lines,
+      '',
+      `Total: ${fmt(total)}`,
+    ].join('\n');
 
-    const data = await res.json();
-
-    if (data.checkoutUrl) {
-      window.location.href = data.checkoutUrl;
-    } else {
-      throw new Error('No se recibió URL de checkout');
-    }
-
+    window.open(`https://wa.me/5492302207044?text=${encodeURIComponent(message)}`, '_blank');
   } catch(err) {
-    showToast('❌ Error al procesar: ' + err.message);
+    showToast('❌ Error al preparar checkout: ' + err.message);
+  } finally {
     if (btn) { btn.disabled = false; btn.textContent = 'Finalizar compra'; }
   }
 }
 
 
-
 // ══════════════════════════════════════════
 // ══════════════════════════════════════════
 // DATA
+
 // ══════════════════════════════════════════
 let products = [];
 
